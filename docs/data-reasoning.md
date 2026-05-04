@@ -83,6 +83,65 @@ Priority queue for coaching messages:
 - Messages expire after 3 seconds (stale)
 - P0 `preempt()` clears all non-safety messages and delivers immediately
 
+### P0 Safety Bypass — parameters and guarantees
+
+DR-2 contract from the April 29 review: *the HOT path can independently fire
+critical alerts even when the COLD path (Gemini) hangs or crashes, without
+waiting for any thread lock.*
+
+**Exact triggers that emit P0** (source: `ACTION_PRIORITY` in
+`coachingService.ts` and `DECISION_MATRIX` in `utils/coachingKnowledge.ts`):
+
+| Action | Hot rule (decisionMatrix) | Notes |
+|--------|---------------------------|-------|
+| `OVERSTEER_RECOVERY` | `\|gLat\| > 0.7 && gLong < -0.3 && throttle < 5 && speed > 40` | Loss of rear grip during decel. Implemented today. |
+| `BRAKE` | Reserved P0 slot — currently emitted via humanization for the BRAKE action; no decision-matrix rule yet. Future feedforward "Brake Now!" alerts (DR-1 / DR-5) will route through this slot. |
+
+`COGNITIVE_OVERLOAD` is P2 and is gated by 10s cadence; it is **not** a safety
+bypass, despite being a driver-state alert.
+
+**Bypass behavior** (load-bearing properties — verified in
+`coachingService.p0Stress.test.ts`):
+
+1. **Skips TimingGate blackout** — `TimingGate.canDeliver(0)` returns `true`
+   unconditionally; `runHotPath` calls `emit()` directly for `priority === 0`,
+   which routes through `coachingQueue.preempt()` rather than `enqueue` +
+   `dequeue`. Mid-corner / apex blackout does not stop a P0.
+2. **Preempts CoachingQueue** — `preempt()` filters the queue down to existing
+   P0 entries and returns the new decision for immediate delivery. Pending
+   P1/P2/P3 messages are dropped.
+3. **No humanization budget enforcement** — `humanizeAction()` is called
+   inline; there is no async path between rule match and listener emit.
+4. **No cold-path dependency** — `runColdPath` is invoked via `void` *after*
+   the hot path has already executed, so its `await fetch(...)` cannot block
+   any prior P0 delivery. The cold path's cooldown (`lastColdTime`) is set
+   *before* the await, so an in-flight hung request does not pile up
+   additional fetches.
+5. **Goal boost cannot demote a non-P0 to P0** — `boostForGoals` returns
+   early when `base === 0` and floors goal-boosted priorities at 1, so a
+   tactical message can never accidentally bypass the gate.
+
+**Failure modes that do NOT affect P0 delivery:**
+
+| Cold-path fault | Tested in p0Stress | Effect on P0 |
+|-----------------|--------------------|--------------|
+| `fetch` returns Promise that never resolves (Gemini wedge) | yes | none — P0 still emitted, hot-path latency unaffected |
+| `fetch` throws synchronously (programmer error / null deref) | yes | none — caught by cold path's `try/catch`; hot path is upstream |
+| `fetch` resolves slowly (5s+ — degraded network) | yes | none — `void`-dispatched, hot path returns first |
+| Network down / offline at the track | implicit (`fetch` rejects) | none — same path as the throw case |
+| No API key configured | yes (control case) | cold path short-circuits; hot path unchanged |
+
+**Latency budget:** the HOT path's documented budget is < 50ms per frame
+(`coachingService.latency.test.ts` measures p99 < 15ms in practice). The P0
+stress tests assert a < 100ms wall-clock bound under fault injection, loose
+enough to absorb CI variance but tight enough that any regression that made
+the hot path actually `await` the cold path would break it immediately.
+
+**Test file:** `src/services/__tests__/coachingService.p0Stress.test.ts` —
+seven cases covering each fault mode (hang, sync throw, slow resolve,
+success), the bypass contract under TimingGate BLACKOUT, the no-cold-path
+control, and repeated P0s with a hung cold path.
+
 ### Driver Model
 
 **File:** `src/services/driverModel.ts`
@@ -211,37 +270,106 @@ npm install
 npm test
 ```
 
-This runs `vitest run` and executes all 60 tests across 9 test files:
+This runs `vitest run` and executes all **185 tests across 32 test files**:
 
 ```
- Test Files  9 passed (9)
-      Tests  60 passed (60)
+ Test Files  32 passed (32)
+      Tests  185 passed (185)
 ```
 
-### Test files
+### Test suite layout
 
-| File | Module | Tests |
-|------|--------|-------|
-| `src/utils/__tests__/geoUtils.test.ts` | Haversine, heading, GPS validation | 11 |
-| `src/utils/__tests__/decisionMatrix.test.ts` | Decision matrix rules and ordering | 7 |
-| `src/services/__tests__/cornerPhaseDetector.test.ts` | G-force fallback + GPS detection | 8 |
-| `src/services/__tests__/timingGate.test.ts` | State machine transitions, blackout, cooldown | 4 |
-| `src/services/__tests__/coachingQueue.test.ts` | Priority sorting, stale expiry, preempt | 4 |
-| `src/services/__tests__/driverModel.test.ts` | Skill classification, smoothness | 3 |
-| `src/services/__tests__/performanceTracker.test.ts` | Corner metrics, improvement detection, trends | 8 |
-| `src/services/__tests__/coachingServicePhase6.test.ts` | HUSTLE, session goals, Ross Bentley phrases | 10 |
-| `src/__tests__/sonomaReplay.test.ts` | **Integration:** CSV parse → phase detect → coaching | 5 |
+Tests are organized by what they prove, not by file order. Each test file is named after the module or feedback item it covers; a few files cover a single API in depth (e.g. `feedforwardGeofence`, `coldPromptStructure`).
+
+#### Foundation tests — pre-existing modules
+
+These tests cover the modules built in Phases 0–5 and validate that the data-reasoning core behaves correctly in isolation. They are the regression net for everything else.
+
+| File | Tests | What it proves |
+|---|---:|---|
+| `src/utils/__tests__/geoUtils.test.ts` | 12 | Haversine distance, equirectangular pre-filter, bearing/heading math, `isValidGps` rejects (0, 0) and out-of-range coordinates. |
+| `src/utils/__tests__/decisionMatrix.test.ts` | 7 | Each decision rule fires for the right input shape; rule ordering is stable; no rule shadows another at the same priority. |
+| `src/services/__tests__/cornerPhaseDetector.test.ts` | 13 | GPS-primary phase detection produces all 5 phases on a Sonoma replay; G-force fallback path works track-agnostically; equirectangular pre-filter actually skips far corners without computing haversine. |
+| `src/services/__tests__/coachingQueue.test.ts` | 4 | Priority sort (P0 first), 3-second stale expiry on dequeue, P0 `preempt()` clears the queue, max-size enforcement. |
+| `src/services/__tests__/timingGate.test.ts` | 8 | Full state machine: OPEN→DELIVERING→COOLDOWN→BLACKOUT and back. Critical regression cases: COOLDOWN-interrupted-by-BLACKOUT restores to COOLDOWN (not OPEN), P0 re-entry during DELIVERING anchors the cooldown to the new message, P0 bypasses BLACKOUT. |
+| `src/services/__tests__/driverModel.test.ts` | 8 | BEGINNER/INTERMEDIATE/ADVANCED classification from smoothness + coasting; 5s hysteresis prevents oscillation; re-promotion guard. |
+| `src/services/__tests__/performanceTracker.test.ts` | 11 | Per-corner metrics (min speed, brake point, throttle %), lap-over-lap improvement detection, encouragement emission, dropped-improvement regression (PR #2 review). |
+| `src/services/__tests__/coachingServicePhase6.test.ts` | 16 | HUSTLE/lazy-throttle detection on exits, `setSessionGoals()` priority boost (floored at P1), Ross Bentley trigger phrases ("Hard initial!", "Eyes up!", "Hustle!"). |
+| `src/__tests__/sonomaReplay.test.ts` | 4 | **End-to-end integration.** CSV → phase detection → coaching emission, with both G-force-only and GPS+track paths. See [Integration Test Details](#integration-test-details). |
+
+#### April 29 feedback tests — new this phase
+
+These six files were added on the `data-reasoning` branch in response to the April 29 conditional-pass review. Each file is paired with one feedback item (DR-1 through DR-6) and is the proof-of-fix for that item.
+
+| File | Tests | Feedback item proved |
+|---|---:|---|
+| `src/services/__tests__/coachingService.p0Stress.test.ts` | 7 | **DR-2** — P0 safety bypass continues firing when COLD path hangs (Promise that never resolves), throws synchronously, takes 5+ seconds, or succeeds (control). All four fault modes assert the P0 decision is emitted at `priority === 0` within a 100ms wall-clock HOT budget. Three additional cases verify P0 fires through TimingGate setup, with no API key, and across repeated P0 events while COLD is hung. |
+| `src/services/__tests__/coachingService.latency.test.ts` | 2 | HOT-path latency benchmark (1000 frames). Reports mean / p99 / max, asserts p99 stays inside the 50ms budget. Used as the control for DR-3. |
+| `src/services/__tests__/coachingService.humanizationBudget.test.ts` | 2 | **DR-3** — humanization stays under the 50ms tripwire across 1000 frames; when an artificial 60ms spin is injected into `humanizeAction`, the next emission falls back to the raw action label and then auto-disarms. |
+| `src/services/__tests__/feedforwardGeofence.test.ts` | 14 | **DR-1 + DR-5.** DR-1 (8): `getTriggerDistance` returns 0 at idle (no fire), clamps to `MIN_TRIGGER_M` floor at very low non-zero speed, scales linearly with velocity, fires inside the scaled radius and not outside, at 30 / 60 / 100 mph the fire/no-fire boundary lines up with the configured lead time within ±10%. DR-5 (6): corners with `visualReference` produce a FEEDFORWARD message containing the cue; corners without it produce the legacy `name: advice` message; whitespace-only `visualReference` falls back to legacy. |
+| `src/services/__tests__/coachingService.safetyOverride.test.ts` | 4 | **DR-6** — humanization is bypassed and the raw imperative is emitted when (a) the action is `OVERSTEER_RECOVERY` at any speed, or (b) the action is BRAKE-class at speed > 70 mph. Humanization is preserved when (c) BRAKE fires at ≤ 70 mph (control), or (d) any non-safety action fires regardless of speed (control). |
+| `src/services/__tests__/coldPromptStructure.test.ts` | 22 | **DR-4** — `buildColdPrompt` includes the explicit "do not restate the symptom" directive, names every physics lever (weight transfer, friction circle, brake-release rate, throttle-application rate), populates them with real numbers from the telemetry window (different scenarios produce different prompts), demands a `Symptom: / Root Cause: / Fix:` output schema, demands the Root Cause cite a number, and adapts to skill level. Includes a snapshot test of the canonical missed-apex prompt so future drift is reviewable. `computePhysicsContext` is unit-tested separately for abrupt-brake-release detection, throttle-rate sign, friction-limit flagging, and zero-input safety. The `brakeReleasedInWindow` flag (audit-1 fix B4) is also tested here. |
+
+#### Audit-fix regression tests
+
+Two post-gate audits surfaced bugs that became regression tests. Each file is paired with one finding from the audit so a future regression has a named signal in CI.
+
+| File | Tests | Finding it locks down |
+|---|---:|---|
+| `src/services/__tests__/coachingService.safetyOverridePromotion.test.ts` | 3 | **Audit-1 B2** — when DR-6 safety override fires for a P1 BRAKE-class action at high speed, priority is promoted to P0 so the message bypasses the TimingGate's MID_CORNER blackout (instead of being silenced). Includes a control case that asserts P1 stays P1 below the speed threshold. |
+| `src/services/__tests__/coachingService.processFrameLatency.test.ts` | 5 | **Audit-1 B5 + Audit-2** — full HOT-path latency stats (entry → after `drainQueue`/listener callbacks). Includes a control with the buffer empty (count=0, no NaN), a 1000-frame p99 < 50ms assertion, an isolation test that humanization slowdown is reflected separately, and verification that the circular ring-buffer cap holds at 2000 samples. |
+
+#### Latency / timing test suite (9 files)
+
+Timing is the load-bearing non-functional property of the coach ("feedback 800ms late is worse than silence"). These tests target failure modes that correctness tests cannot catch.
+
+| File | Tests | What it proves |
+|---|---:|---|
+| `src/services/__tests__/coachingService.latency.test.ts` | 2 | HOT-path latency benchmark — 1000 frames, mean / p99 / max reported, p99 < 50ms. The control for DR-3. |
+| `src/services/__tests__/coachingService.burstLatency.test.ts` | 1 | Sustained 25 Hz burst over 250 frames (10 simulated seconds). No per-frame overshoot. Cumulative drift < 200ms. |
+| `src/services/__tests__/coachingService.concurrentLoad.test.ts` | 2 | HOT path is unaffected by an in-flight COLD path that takes 5 seconds to respond. |
+| `src/services/__tests__/coachingService.coldRecovery.test.ts` | 4 | After a `fetch` failure, the COLD path retries on the next eligible frame (within 2 frames / ≤ 80ms). |
+| `src/services/__tests__/coachingService.coldWarmCold.test.ts` | 2 | First Gemini call vs subsequent — slow cold-start (2s) does not slow down HOT path frames that fire in parallel. |
+| `src/services/__tests__/coachingService.networkJitter.test.ts` | 2 | Across 100 simulated runs with random network latency drawn from `[100, 300, 800, 2500, 5000]ms`, no HOT-path frame exceeds the 50ms p99 budget. |
+| `src/services/__tests__/timingGate.transitionLatency.test.ts` | 1 | TimingGate state-transition cost is sub-microsecond (<100µs / call across 10000 cycles). |
+| `src/services/__tests__/coachingQueue.staleExpiry.test.ts` | 4 | 3-second stale-message expiry boundary tested at millisecond precision (t=2999ms returned, t=3000ms rejected, t=3001ms rejected). |
+| `src/services/__tests__/feedforwardGeofence.timeToCorner.test.ts` | 4 | DR-1's promised cognitive headroom — for every Sonoma corner at 30 / 60 / 90 mph, `time_to_corner` at fire moment is ≥ 4.4s above 60 mph (4.5s minus 100ms frame-step discretization), ≥ 3.0s otherwise. |
+
+#### Robustness test suite (5 files)
+
+Failure modes the production code may encounter at the track that aren't latency-related: memory pressure, long sessions, listener fan-out, audio dispatch, and frame-stream pathology.
+
+| File | Tests | What it proves |
+|---|---:|---|
+| `src/services/__tests__/coachingService.memoryPressure.test.ts` | 2 | HOT-path stays under budget when the heap is being churned (100 KB throwaway allocations between every frame, 5000 frames). Compared against a control. |
+| `src/services/__tests__/coachingService.longSession.test.ts` | 1 | 1-hour simulated session (90000 frames) — no monotonic heap growth, no progressive p99 slowdown, ring buffers stay capped at 2000 samples. |
+| `src/services/__tests__/coachingService.listenerFanOut.test.ts` | 2 | HOT-path latency does not degrade with N listeners — `p99(100) / p99(1) < 10×`. Mid-frame subscribe/unsubscribe is exception-safe and bounded above (≤ 200 invocations between subscribe and unsubscribe events). |
+| `src/services/__tests__/coachingService.audioDispatch.test.ts` | 2 | A 1.5s async listener (simulating TTS dispatch) does NOT back-pressure `processFrame`. HOT-path p99 is unaffected by a slow async listener. |
+| `src/services/__tests__/coachingService.frameIntegrity.test.ts` | 4 | Duplicate frame, out-of-order frame, 250ms frame-drop gap, and malformed frame (NaN / undefined / out-of-range telemetry) are all handled without exceptions. The `isValidGps` gate keeps invalid GPS from producing FEEDFORWARD. |
+| `src/services/__tests__/coachingService.subsystemBreakdown.test.ts` | 2 | Per-subsystem p99 attribution (DriverModel, CornerPhaseDetector, decision matrix, queue, real humanization timings via the DR-3 ring buffer). Fingerprints the bottleneck so a regression has a named signal. |
+| `src/services/__tests__/coachingService.clusteredCorners.test.ts` | 4 | Heading-aware FEEDFORWARD on a synthetic 3-corner cluster — each corner emits while still ahead, with TTC ≥ 3.0s. Includes the heading-fallback case (no GPS history) and the behind-driver rejection case. |
 
 ### Run a specific test file
 
 ```bash
-npx vitest run src/__tests__/sonomaReplay.test.ts
+npx vitest run src/services/__tests__/coachingService.p0Stress.test.ts
 ```
 
 ### Run tests in watch mode (during development)
 
 ```bash
 npx vitest
+```
+
+### Run only the April 29 feedback tests
+
+```bash
+npx vitest run \
+  src/services/__tests__/coachingService.p0Stress.test.ts \
+  src/services/__tests__/coachingService.humanizationBudget.test.ts \
+  src/services/__tests__/coachingService.safetyOverride.test.ts \
+  src/services/__tests__/feedforwardGeofence.test.ts \
+  src/services/__tests__/coldPromptStructure.test.ts
 ```
 
 ### Integration Test Details
@@ -254,6 +382,14 @@ The Sonoma replay integration test (`src/__tests__/sonomaReplay.test.ts`) valida
 4. **GPS-based corner detection** — Loads Sonoma test track fixture, feeds frames with GPS coordinates near Turn 1, and verifies the detector identifies the corner by ID.
 
 The CSV fixture uses TrackAddict column format (`Speed (MPH)`, `Accel X`, `Accel Y`, `Brake (calculated)`, `Throttle Position (%) *OBD`).
+
+### Test discipline — how new tests get added
+
+- **One feedback item ↔ one test file.** When a reviewer raises something specific (e.g. "what about cold-path hangs?"), the resolution lives in a file named after the concern. This is what `coachingService.p0Stress.test.ts` was named for.
+- **Failing-first.** Every new test starts as a fail. We confirm the failure mode matches the bug or gap *before* writing the production-code fix. This is the only way to be sure the test isn't passing for the wrong reason.
+- **No mocked time in latency tests.** `coachingService.latency.test.ts` and the DR-3 budget test use real `performance.now()`. Mocked time can hide real regressions where the harness is fast but production code is slow. CI slack is documented in each file (typically 50ms vs ~sub-ms observed = ~50× headroom before flake).
+- **Snapshot for prompt drift.** The COLD prompt has a snapshot test (`coldPromptStructure.test.ts`) so any future change to the prompt template surfaces as a reviewable diff, not as an undetected regression.
+- **Regressions for every reviewer-raised bug.** PR #2 Bugbot findings (P0 floor, dropped improvements, dead code) each have a dedicated test in `performanceTracker` / `timingGate` / `coachingServicePhase6`. The April 29 feedback follows the same rule.
 
 ---
 

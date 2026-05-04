@@ -1,14 +1,54 @@
 import type { TelemetryFrame, CoachAction, Corner, Track, CoachingDecision, CornerPhase, SessionGoal } from '../types';
 import { COACHES, DEFAULT_COACH, DECISION_MATRIX, RACING_PHYSICS_KNOWLEDGE } from '../utils/coachingKnowledge';
-import { haversineDistance, isValidGps } from '../utils/geoUtils';
+import { haversineDistance, isValidGps, calculateHeading } from '../utils/geoUtils';
 import { CornerPhaseDetector } from './cornerPhaseDetector';
 import { TimingGate } from './timingGate';
 import { CoachingQueue } from './coachingQueue';
 import { DriverModel } from './driverModel';
 import { PerformanceTracker } from './performanceTracker';
+import { buildColdPrompt } from './coldPromptBuilder';
+
+// ── DR-3: Humanization latency budget ─────────────────────
+/** If a single humanizeAction call exceeds this, the NEXT hot-path emission
+ *  drops humanization and emits the raw action label (e.g. "BRAKE") instead.
+ *  Humanization should normally be sub-millisecond — 50ms is a tripwire,
+ *  not an expected operating point. */
+const HUMANIZATION_BUDGET_MS = 50;
+
+// ── DR-6: Safety-override of humanization ─────────────────
+/** Above this speed, BRAKE-class actions bypass humanization and emit a
+ *  short authoritative imperative. Frame speed is in mph (see TelemetryFrame). */
+const HIGH_SPEED_BRAKE_THRESHOLD_MPH = 70;
+
+/** Actions that are "BRAKE-class" for the high-speed safety override.
+ *  Excludes TRAIL_BRAKE: trail braking is a deliberate technique, not an
+ *  emergency. Treating it as "Brake hard!" at speed would be coaching the
+ *  driver out of a correct input. (Audit B2.) */
+const BRAKE_CLASS_ACTIONS: ReadonlySet<CoachAction> = new Set<CoachAction>([
+  'BRAKE', 'THRESHOLD', 'SPIKE_BRAKE',
+]);
+
+/** Terse, authoritative imperatives for safety-override emissions.
+ *  Tone borrowed from Ross Bentley trigger phrases ("Both feet in!" /
+ *  "Brake hard!" / "Eyes up!"). Only actions reachable via the override need
+ *  entries — anything else falls back to the raw action label. */
+const SAFETY_OVERRIDE_TEXT: Partial<Record<CoachAction, string>> = {
+  OVERSTEER_RECOVERY: 'Both feet in!',
+  BRAKE: 'Brake hard!',
+  THRESHOLD: 'Brake hard!',
+  SPIKE_BRAKE: 'Brake hard!',
+};
 
 /** Map actions to priority levels (module-level Map avoids per-call array allocations).
- *  Safety bypass is determined by `priority === 0` at the call site, not by a separate set. */
+ *  Safety bypass is determined by `priority === 0` at the call site, not by a separate set.
+ *
+ *  THRESHOLD asymmetry note: THRESHOLD is intentionally NOT in this map. It
+ *  defaults to P1 via the `?? 1` fallback below. THRESHOLD only escalates to
+ *  P0 dynamically when the DR-6 safety override fires (speed > 70 mph and
+ *  action ∈ BRAKE_CLASS_ACTIONS). Adding `['THRESHOLD', 0]` here would make
+ *  it always P0 regardless of speed — over-aggressive. Adding `['THRESHOLD',
+ *  1]` would be redundant with the default. The asymmetry is load-bearing;
+ *  do not "fix" it without changing the override path too. */
 const ACTION_PRIORITY: Map<string, 0 | 1 | 2 | 3> = new Map([
   ['OVERSTEER_RECOVERY', 0], ['BRAKE', 0],
   ['EARLY_THROTTLE', 1], ['LIFT_MID_CORNER', 1], ['SPIKE_BRAKE', 1],
@@ -22,6 +62,46 @@ function actionPriority(action: CoachAction): 0 | 1 | 2 | 3 {
 }
 
 type CoachingCallback = (msg: CoachingDecision) => void;
+
+// ── FEEDFORWARD geofence tunables (DR-1) ───────────────────
+// Replace the legacy static 150m radius with a velocity-scaled trigger so
+// the lead time the driver gets is constant in *seconds*, not in metres.
+// At 100 mph a 150m fence gave only ~3.3s of lead — minus a 1.5s TTS budget
+// the driver had ~1.8s of cognitive headroom. Scaling by velocity gives
+// FEEDFORWARD_LEAD_S of true thinking time at every speed.
+//
+//   triggerDistance = max(MIN_TRIGGER_M, v_mps * (FEEDFORWARD_LEAD_S + TTS_BUDGET_S))
+export const FEEDFORWARD_LEAD_S = 3.0;
+export const TTS_BUDGET_S = 1.5;
+export const MIN_TRIGGER_M = 40;
+/** Audit B3: upper cap on the velocity-scaled geofence. Without this, the
+ *  trigger grows unbounded with speed — at 140 mph the unclamped value is
+ *  ~280m, which overlaps adjacent corners in dense complexes (Sonoma T2/T3),
+ *  firing FEEDFORWARD for the next corner while the driver is still in the
+ *  current one. 250m gives a generous lead at any realistic track speed
+ *  without bleeding across complex sections. */
+export const MAX_TRIGGER_M = 250;
+export const MPH_TO_MPS = 0.44704;
+
+/** Velocity-scaled FEEDFORWARD geofence radius (DR-1).
+ *  Returns 0 when stationary so the path does not fire at idle.
+ *  Clamped to [MIN_TRIGGER_M, MAX_TRIGGER_M] at the bounds. */
+export function getTriggerDistance(speedMph: number): number {
+  if (!Number.isFinite(speedMph) || speedMph <= 0) return 0;
+  const vMps = speedMph * MPH_TO_MPS;
+  const scaled = vMps * (FEEDFORWARD_LEAD_S + TTS_BUDGET_S);
+  return Math.min(MAX_TRIGGER_M, Math.max(MIN_TRIGGER_M, scaled));
+}
+
+/** Build the FEEDFORWARD message text for a corner (DR-5).
+ *  When the corner has a `visualReference`, prepend it so the driver is told
+ *  where to *look* before being told what to do with the pedals. */
+export function buildFeedforwardText(corner: Corner): string {
+  if (corner.visualReference && corner.visualReference.trim().length > 0) {
+    return `${corner.name}: ${corner.visualReference}. ${corner.advice}`;
+  }
+  return `${corner.name}: ${corner.advice}`;
+}
 
 /**
  * Split-brain coaching engine:
@@ -39,6 +119,14 @@ export class CoachingService {
   private lastColdTime = 0;
   private lastHotAction: CoachAction | null = null;
   private lastCorner: Corner | null = null;
+  // Previous-frame GPS + timestamp, used to derive heading for the heading-aware
+  // feedforward predicate. Reset on setTrack so a fresh session can't reuse a
+  // stale heading. Audit-3 B-2: include `time` so the heading derivation can
+  // reject pairs >500ms apart (GPS dropout under tree cover or in shaded
+  // approaches like Sonoma T10) — a wrong heading from a stale GPS pair could
+  // fire FEEDFORWARD for the wrong corner.
+  private lastFeedforwardGps: { lat: number; lon: number; time: number } | null = null;
+  private static readonly FEEDFORWARD_GPS_STALE_S = 0.5;
   private coldCooldownMs = 15000;
   private apiKey: string | null = null;
 
@@ -51,8 +139,17 @@ export class CoachingService {
   private currentPhase: CornerPhase = 'STRAIGHT';
   private track: Track | null = null;
   private lastSkillLevel: import('../types').SkillLevel = 'BEGINNER';
-  private lastCognitiveCheck = 0;
-  private lastHustleFire = 0;
+  // -1 sentinel = "never checked". Using 0 would falsely fire on a replay
+  // that starts at session-relative time > threshold (e.g. resuming at t=200s
+  // would trigger COGNITIVE_OVERLOAD on frame 1 because 200 - 0 > 10). On the
+  // first frame we record `frame.time` and skip the check. (D-1 audit fix.)
+  private lastCognitiveCheck = -1;
+  private lastHustleFire = -1;
+
+  // Recent telemetry window for the COLD prompt builder. ~2s at 25Hz = 50 frames.
+  // Keep this small — it's read on every cold call but only the cold path needs it.
+  private static readonly COLD_WINDOW_FRAMES = 50;
+  private coldFrameWindow: TelemetryFrame[] = [];
 
   // Session goals (Phase 6.2 — populated by pre-race chat or auto-generated).
   // Actions that appear in any active goal's prioritizedActions get promoted
@@ -60,6 +157,44 @@ export class CoachingService {
   // surface faster. Rebuilt on every setSessionGoals call.
   private sessionGoals: SessionGoal[] = [];
   private prioritizedActionSet: Set<CoachAction> = new Set();
+
+  // ── DR-3: Humanization budget tracking ──────────────────
+  /** Per-call wall-clock samples; bounded ring buffer to avoid unbounded growth. */
+  private humanizationLatencySamples: number[] = [];
+  private static readonly LATENCY_SAMPLE_CAP = 2000;
+
+  // ── B5: Full processFrame HOT-path latency tracking ─────
+  /** Per-frame wall-clock samples covering the SYNCHRONOUS portion of
+   *  processFrame (entry → just before the async cold-path dispatch). This is
+   *  the real HOT-path budget the reviewer asked for (≤50ms). It is strictly
+   *  separate from `humanizationLatencySamples`, which only times the
+   *  humanizeAction call — humanization is one component of processFrame. */
+  private processFrameLatencySamples: number[] = [];
+  /** Audit-3 A-3: absolute session-wide frame counter. The ring buffer caps
+   *  at LATENCY_SAMPLE_CAP (2000), so a long session can't tell from `count`
+   *  alone whether 2000 frames or 50000 frames have been processed. This
+   *  field is the true count, exposed alongside `count` in the stats getter. */
+  private processFrameCount = 0;
+  /** Sticky for ONE emission after a budget breach: next hot-path emission
+   *  uses the raw action label, then this resets. Single-frame stickiness keeps
+   *  the recovery cheap without permanently degrading coaching quality. */
+  private humanizationFallbackArmed = false;
+  private humanizationBudgetMs = HUMANIZATION_BUDGET_MS;
+
+  // ── Audit P2: N-of-M permanent fallback escalation ──────
+  // The DR-3 single-frame sticky fallback bounces between raw and humanized
+  // when humanization is *consistently* slow. Track a bounded window of recent
+  // breach booleans; if the breach rate over the window exceeds the threshold,
+  // permanently disable humanization for the rest of the session.
+  private static readonly HUMANIZATION_BREACH_WINDOW = 100;
+  private static readonly HUMANIZATION_BREACH_THRESHOLD = 0.25;
+  private humanizationBreachWindow: boolean[] = [];
+  private humanizationBreachCount = 0;
+  private humanizationPermanentFallback = false;
+  private humanizationPermanentFallbackWarned = false;
+
+  // ── DR-6: Safety-override threshold (configurable) ──────
+  private highSpeedBrakeThresholdMph = HIGH_SPEED_BRAKE_THRESHOLD_MPH;
 
   // Session progression
   private sessionPhase: 1 | 2 | 3 = 1;
@@ -79,6 +214,7 @@ export class CoachingService {
     // Drop the stale corner reference so the feedforward path doesn't compare
     // a fresh corner against a stale identity from the previous track.
     this.lastCorner = null;
+    this.lastFeedforwardGps = null;
   }
 
   getTimingState() { return this.timingGate.getState(); }
@@ -86,6 +222,149 @@ export class CoachingService {
   getDriverState() { return this.driverModel.getState(); }
   getSessionGoals() { return this.sessionGoals; }
   getPerformanceTracker() { return this.performanceTracker; }
+
+  // ── DR-3 configuration & telemetry ───────────────────────
+  /** Returns the live ring buffer of per-call humanization latencies (ms).
+   *  Tests and the latency benchmark use this. Mutating clears history. */
+  getHumanizationLatencySamples(): number[] { return this.humanizationLatencySamples; }
+  setHumanizationBudgetMs(ms: number): void { this.humanizationBudgetMs = ms; }
+  setHighSpeedBrakeThresholdMph(mph: number): void { this.highSpeedBrakeThresholdMph = mph; }
+
+  /** Audit P2: true once the N-of-M breach threshold is crossed. From this
+   *  point forward, all hot-path emissions are raw action labels — humanization
+   *  is permanently disabled for the rest of the session. */
+  isHumanizationPermanentFallback(): boolean { return this.humanizationPermanentFallback; }
+
+  /** Audit P2: testing hook. Resets the permanent-fallback flag, clears
+   *  the breach window, and zeroes the humanization latency buffer + head
+   *  pointer so a test can simulate a genuinely fresh session. (Audit-3 A-1:
+   *  the previous version left stale samples in the ring buffer with a
+   *  non-zero head, so "fresh session" wasn't actually fresh.) */
+  resetHumanizationFallback(): void {
+    this.humanizationPermanentFallback = false;
+    this.humanizationPermanentFallbackWarned = false;
+    this.humanizationBreachWindow = [];
+    this.humanizationBreachCount = 0;
+    this.humanizationFallbackArmed = false;
+    this.humanizationLatencySamples = [];
+    this.latencyBufferHead.humanization = 0;
+  }
+
+  // ── B5 public API: full processFrame HOT-path latency stats ───
+  /** Stats over the synchronous portion of processFrame (the HOT path).
+   *  - `count` = number of samples currently in the ring buffer (capped at
+   *    LATENCY_SAMPLE_CAP). Useful for percentile interpretation.
+   *  - `totalFrames` = absolute number of frames processed this session
+   *    (audit-3 A-3). Tells the caller whether the buffer has wrapped.
+   *  Returns zeros when the buffer is empty (e.g. before any frame has
+   *  been processed) so callers don't need to special-case it. */
+  getProcessFrameLatencyStats(): { mean: number; p50: number; p99: number; max: number; count: number; totalFrames: number } {
+    const s = this.processFrameLatencySamples;
+    const count = s.length;
+    if (count === 0) return { mean: 0, p50: 0, p99: 0, max: 0, count: 0, totalFrames: this.processFrameCount };
+    // Sort a copy — we don't want to disturb insertion order in the live buffer.
+    const sorted = s.slice().sort((a, b) => a - b);
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    return {
+      mean: sum / count,
+      p50: sorted[Math.floor(count * 0.5)],
+      p99: sorted[Math.min(count - 1, Math.floor(count * 0.99))],
+      max: sorted[count - 1],
+      count,
+      totalFrames: this.processFrameCount,
+    };
+  }
+
+  /** Clears the processFrame latency ring buffer and the absolute session
+   *  frame counter. Independent from the humanization buffer. */
+  resetProcessFrameLatencyStats(): void {
+    this.processFrameLatencySamples = [];
+    this.latencyBufferHead.processFrame = 0;
+    this.processFrameCount = 0;
+  }
+
+  /**
+   * DR-6: Should we bypass humanization and emit a terse safety imperative?
+   *  (a) OVERSTEER_RECOVERY — always (high-slip, regardless of speed).
+   *  (b) BRAKE-class action AND speed > threshold (panic-brake at speed).
+   * Public for unit testing of the predicate in isolation.
+   */
+  shouldBypassHumanization(action: CoachAction, frame: TelemetryFrame): boolean {
+    if (action === 'OVERSTEER_RECOVERY') return true;
+    if (BRAKE_CLASS_ACTIONS.has(action) && frame.speed > this.highSpeedBrakeThresholdMph) return true;
+    return false;
+  }
+
+  /**
+   * Wraps humanizeAction with:
+   *  - DR-6 safety bypass (returns SAFETY_OVERRIDE_TEXT, no humanization at all)
+   *  - DR-3 raw-label fallback (if the previous call breached the budget, return
+   *    the raw action label this once and disarm the flag)
+   *  - DR-3 latency measurement (records every call that DOES humanize)
+   */
+  private humanizeOrFallback(action: CoachAction, frame: TelemetryFrame): string {
+    // DR-6 takes precedence — the override imperative is the right output
+    // regardless of any DR-3 budget state. We do NOT measure these calls.
+    if (this.shouldBypassHumanization(action, frame)) {
+      return SAFETY_OVERRIDE_TEXT[action] ?? action;
+    }
+    // Audit P2: once permanent fallback is engaged, never humanize again
+    // for the rest of the session — humanization is consistently too slow.
+    if (this.humanizationPermanentFallback) {
+      return action;
+    }
+    // DR-3 fallback: prior call breached the budget → emit raw label this once.
+    if (this.humanizationFallbackArmed) {
+      this.humanizationFallbackArmed = false;
+      return action;
+    }
+    const start = performance.now();
+    const text = this.humanizeAction(action, frame);
+    const elapsed = performance.now() - start;
+
+    // O(1) circular buffer push — shift() is O(N) and would be measurable
+    // when called at 25Hz on a Pixel 10 with cap 2000.
+    this.pushLatencySample(this.humanizationLatencySamples, elapsed);
+
+    const breached = elapsed > this.humanizationBudgetMs;
+    if (breached) {
+      this.humanizationFallbackArmed = true;
+      if (import.meta.env.DEV) {
+        console.warn(
+          `[humanizeAction] budget breach: ${elapsed.toFixed(2)}ms > ${this.humanizationBudgetMs}ms ` +
+          `(action=${action}). Next emission will use raw label.`,
+        );
+      }
+    }
+
+    // Audit P2: maintain a sliding window of breach booleans. Once breach
+    // rate over the last HUMANIZATION_BREACH_WINDOW frames exceeds
+    // HUMANIZATION_BREACH_THRESHOLD, escalate to permanent fallback.
+    this.humanizationBreachWindow.push(breached);
+    if (breached) this.humanizationBreachCount++;
+    if (this.humanizationBreachWindow.length > CoachingService.HUMANIZATION_BREACH_WINDOW) {
+      const dropped = this.humanizationBreachWindow.shift();
+      if (dropped) this.humanizationBreachCount--;
+    }
+    if (
+      !this.humanizationPermanentFallback &&
+      this.humanizationBreachWindow.length >= CoachingService.HUMANIZATION_BREACH_WINDOW &&
+      this.humanizationBreachCount >
+        CoachingService.HUMANIZATION_BREACH_WINDOW * CoachingService.HUMANIZATION_BREACH_THRESHOLD
+    ) {
+      this.humanizationPermanentFallback = true;
+      if (!this.humanizationPermanentFallbackWarned) {
+        this.humanizationPermanentFallbackWarned = true;
+        console.warn(
+          `[humanizeAction] permanent fallback engaged: ` +
+          `${this.humanizationBreachCount}/${this.humanizationBreachWindow.length} frames ` +
+          `exceeded ${this.humanizationBudgetMs}ms budget. ` +
+          `All emissions will use raw action labels for the rest of the session.`,
+        );
+      }
+    }
+    return text;
+  }
 
   /** Call when a new lap starts (e.g. from lap detection logic).
    *  Surfaces the flushed corner's improvement decision into the queue. */
@@ -139,6 +418,16 @@ export class CoachingService {
 
   /** Called on every telemetry frame */
   processFrame(frame: TelemetryFrame) {
+    // B5: time the SYNCHRONOUS HOT path (entry → just before async cold dispatch).
+    // Reviewer's budget is ≤50ms HOT path total — humanization alone isn't enough.
+    const hotPathStart = performance.now();
+
+    // Maintain rolling window for COLD prompt builder (DR-4).
+    this.coldFrameWindow.push(frame);
+    if (this.coldFrameWindow.length > CoachingService.COLD_WINDOW_FRAMES) {
+      this.coldFrameWindow.shift();
+    }
+
     // Detect corner phase
     const detection = this.cornerDetector.detect(frame);
     this.currentPhase = detection.phase;
@@ -165,10 +454,42 @@ export class CoachingService {
     this.checkCognitiveOverload(frame);
     this.checkHustle(frame);
     this.runFeedforward(frame);
+
+    // Cold path is fire-and-forget; only the synchronous portion (up to its
+    // first await) counts toward the HOT budget.
     void this.runColdPath(frame);
 
-    // Drain queue — deliver highest-priority message if timing allows
+    // Drain queue — deliver highest-priority message if timing allows.
+    // listener callbacks fire synchronously inside drainQueue → emit().
     this.drainQueue();
+
+    // B5: stop measurement AFTER drainQueue so listener-callback cost is
+    // included in the HOT-path budget. The reviewer asked for ≤50ms total
+    // HOT path; if a listener does heavy synchronous TTS dispatch work,
+    // that *is* on the HOT path even though it logically follows emission.
+    // Anything truly async (the awaited fetch inside runColdPath) is excluded.
+    const hotPathElapsed = performance.now() - hotPathStart;
+    this.pushLatencySample(this.processFrameLatencySamples, hotPathElapsed);
+    this.processFrameCount += 1;
+  }
+
+  /** O(1) bounded ring-buffer push.
+   *  `Array.shift()` is O(N) at 25Hz over 2000 samples — measurable on a
+   *  Pixel 10 PWA. Use circular semantics: when full, overwrite the oldest
+   *  slot via head index. We expose the buffer as a flat array via the public
+   *  stats getter, which is read-rarely; that copy is O(N) but only when
+   *  someone actually inspects stats. */
+  private latencyBufferHead = { processFrame: 0, humanization: 0 };
+  private pushLatencySample(buf: number[], v: number): void {
+    const cap = CoachingService.LATENCY_SAMPLE_CAP;
+    const isProcess = buf === this.processFrameLatencySamples;
+    const headKey = isProcess ? 'processFrame' : 'humanization';
+    if (buf.length < cap) {
+      buf.push(v);
+    } else {
+      buf[this.latencyBufferHead[headKey]] = v;
+      this.latencyBufferHead[headKey] = (this.latencyBufferHead[headKey] + 1) % cap;
+    }
   }
 
   private drainQueue(): void {
@@ -237,13 +558,23 @@ export class CoachingService {
         // Skip repeats
         if (rule.action === this.lastHotAction) continue;
 
-        const priority = this.boostForGoals(rule.action, actionPriority(rule.action));
+        let priority = this.boostForGoals(rule.action, actionPriority(rule.action));
         this.lastHotAction = rule.action;
+
+        // Audit B2: when DR-6 safety override applies to a non-P0 action
+        // (e.g. THRESHOLD, SPIKE_BRAKE at >70 mph), promote priority to P0
+        // so the message bypasses the TimingGate MID_CORNER blackout. The
+        // text is already the override imperative; without P0 promotion the
+        // override imperative would be silenced mid-corner — exactly the
+        // moment a panicked driver needs it.
+        if (priority !== 0 && this.shouldBypassHumanization(rule.action, frame)) {
+          priority = 0;
+        }
 
         const decision: CoachingDecision = {
           path: 'hot',
           action: rule.action,
-          text: this.humanizeAction(rule.action, frame),
+          text: this.humanizeOrFallback(rule.action, frame),
           priority,
           cornerPhase: this.currentPhase,
           timestamp: Date.now(),
@@ -262,6 +593,12 @@ export class CoachingService {
 
   /** Check driver model for cognitive overload — runs outside decision matrix */
   private checkCognitiveOverload(frame: TelemetryFrame): void {
+    // First frame of the session (or replay) — seed the timer and skip.
+    // Otherwise a replay starting at e.g. t=200s would fire instantly.
+    if (this.lastCognitiveCheck === -1) {
+      this.lastCognitiveCheck = frame.time;
+      return;
+    }
     // Only check every 10 seconds
     if (frame.time - this.lastCognitiveCheck < 10) return;
     this.lastCognitiveCheck = frame.time;
@@ -271,7 +608,7 @@ export class CoachingService {
       this.coachingQueue.enqueue({
         path: 'hot',
         action: 'COGNITIVE_OVERLOAD',
-        text: this.humanizeAction('COGNITIVE_OVERLOAD', frame),
+        text: this.humanizeOrFallback('COGNITIVE_OVERLOAD', frame),
         priority: this.boostForGoals('COGNITIVE_OVERLOAD', 2),
         cornerPhase: this.currentPhase,
         timestamp: Date.now(),
@@ -288,6 +625,11 @@ export class CoachingService {
    * moment conditions actually match). Beginner-focused: BEGINNER skill only.
    */
   private checkHustle(frame: TelemetryFrame): void {
+    // First frame of the session — seed the timer and skip (D-1 audit fix).
+    if (this.lastHustleFire === -1) {
+      this.lastHustleFire = frame.time;
+      return;
+    }
     if (frame.time - this.lastHustleFire < 8) return;
     if (this.driverModel.getSkillLevel() !== 'BEGINNER') return;
 
@@ -301,7 +643,7 @@ export class CoachingService {
       this.coachingQueue.enqueue({
         path: 'hot',
         action: 'HUSTLE',
-        text: this.humanizeAction('HUSTLE', frame),
+        text: this.humanizeOrFallback('HUSTLE', frame),
         priority: this.boostForGoals('HUSTLE', 3),
         cornerPhase: this.currentPhase,
         timestamp: Date.now(),
@@ -564,6 +906,25 @@ export class CoachingService {
 
   // ── COLD PATH: Gemini Cloud detailed analysis ──────────
 
+  /**
+   * Build the COLD prompt for the current state. Pure-ish (depends on this.*),
+   * exposed so tests can render the prompt without invoking Gemini. DR-4.
+   */
+  buildColdPromptForCurrentState(frame?: TelemetryFrame): string {
+    const coach = this.getCoach();
+    const window = frame
+      ? [...this.coldFrameWindow, ...(this.coldFrameWindow[this.coldFrameWindow.length - 1] === frame ? [] : [frame])]
+      : this.coldFrameWindow;
+    return buildColdPrompt({
+      frames: window,
+      cornerPhase: this.currentPhase,
+      corner: this.lastCorner,
+      skillLevel: this.driverModel.getSkillLevel(),
+      systemPrompt: coach.systemPrompt,
+      physicsKnowledge: RACING_PHYSICS_KNOWLEDGE,
+    });
+  }
+
   private async runColdPath(frame: TelemetryFrame) {
     const now = Date.now();
     if (now - this.lastColdTime < this.coldCooldownMs) return;
@@ -573,34 +934,8 @@ export class CoachingService {
     // On fetch failure we reset to 0 below so offline → back-online recovers quickly
     // instead of silently burning a 15–20s window per failure.
     this.lastColdTime = now;
-    const coach = this.getCoach();
 
-    const cornerName = this.lastCorner?.name || 'straight';
-    const cornerAdvice = this.lastCorner?.advice || '';
-
-    const skillLevel = this.driverModel.getSkillLevel();
-    let instruction: string;
-    switch (skillLevel) {
-      case 'BEGINNER':
-        instruction = 'Give ONE simple instruction using feel-based language. No jargon. Under 10 words. Sound like a patient driving instructor.';
-        break;
-      case 'ADVANCED':
-        instruction = 'Give a data-driven analysis referencing the telemetry numbers. Be concise. Under 15 words.';
-        break;
-      default:
-        instruction = 'Give a technique instruction with a brief physics explanation. Under 20 words.';
-    }
-
-    const prompt = `${coach.systemPrompt}
-
-${RACING_PHYSICS_KNOWLEDGE}
-
-Current Telemetry:
-Speed: ${frame.speed.toFixed(1)} mph | Brake: ${frame.brake.toFixed(0)}% | Throttle: ${frame.throttle.toFixed(0)}%
-G-Lat: ${frame.gLat.toFixed(2)} | G-Long: ${frame.gLong.toFixed(2)}
-Location: ${cornerName} - ${cornerAdvice}
-
-${instruction}`;
+    const prompt = this.buildColdPromptForCurrentState(frame);
 
     try {
       const res = await fetch(
@@ -641,13 +976,42 @@ ${instruction}`;
   private runFeedforward(frame: TelemetryFrame) {
     if (!this.track) return;
     if (!isValidGps(frame.latitude, frame.longitude)) return;
-    const nearest = this.findNearestCorner(frame.latitude, frame.longitude, this.track.corners);
+    // DR-1: velocity-scaled geofence. At 0 mph triggerDistance == 0 so the
+    // path does not fire when the car is stationary (e.g. paddock, pre-grid).
+    const triggerDistance = getTriggerDistance(frame.speed);
+    if (triggerDistance <= 0) return;
+
+    // Derive heading from the previous valid GPS sample. If unavailable (first
+    // frame, GPS dropout, or essentially-stationary), heading is null and we
+    // fall back to nearest-only inside findNearestCornerWithinTriggerDistance.
+    // Audit-3 B-2: also reject pairs >0.5s apart (GPS dropout) — a stale pair
+    // produces a wrong heading that could fire FEEDFORWARD for the wrong corner.
+    const prev = this.lastFeedforwardGps;
+    let heading: number | null = null;
+    if (prev) {
+      const ageS = frame.time - prev.time;
+      const tooStale = ageS > CoachingService.FEEDFORWARD_GPS_STALE_S || ageS < 0;
+      if (!tooStale) {
+        // Require at least 0.5m of movement to derive a stable heading. Below
+        // that, GPS noise dominates and the bearing is meaningless.
+        const moved = haversineDistance(prev.lat, prev.lon, frame.latitude, frame.longitude);
+        if (moved >= 0.5) {
+          heading = calculateHeading(prev.lat, prev.lon, frame.latitude, frame.longitude);
+        }
+      }
+    }
+    this.lastFeedforwardGps = { lat: frame.latitude, lon: frame.longitude, time: frame.time };
+
+    const nearest = this.findNearestCornerWithinTriggerDistance(
+      frame.latitude, frame.longitude, this.track.corners, triggerDistance, heading,
+    );
 
     if (nearest && nearest !== this.lastCorner) {
       this.lastCorner = nearest;
       this.coachingQueue.enqueue({
         path: 'feedforward',
-        text: `${nearest.name}: ${nearest.advice}`,
+        // DR-5: vision cue is prepended when the corner has visualReference.
+        text: buildFeedforwardText(nearest),
         priority: 1,
         cornerPhase: this.currentPhase,
         timestamp: Date.now(),
@@ -655,18 +1019,36 @@ ${instruction}`;
     }
   }
 
-  private findNearestCorner(lat: number, lon: number, corners: Corner[]): Corner | null {
-    // Pick the geometrically closest corner within 150m — not the first one in
-    // array order. At Sonoma's T2/T3 complex two corner geofences can overlap;
-    // returning the actually-closest avoids array-order determining which advice fires.
+  /** Pick the geometrically closest corner within `triggerDistance` metres,
+   *  with a heading-aware "ahead of the driver" filter when heading is known.
+   *  At Sonoma's T1/T2/T3 complex the geofences cluster along a single
+   *  approach line, and a pure nearest-wins picker only latches onto the next
+   *  corner after the driver crosses the C1↔C2 midpoint — collapsing
+   *  time-to-corner well below DR-1's 3.0s budget. Rejecting corners ≥ 90°
+   *  behind the driver fixes that.
+   *
+   *  Fallback: when `heading` is null (no GPS history, stationary, or
+   *  sub-0.5m movement), we use the original nearest-only behavior so fresh
+   *  sessions still fire FEEDFORWARD on the first frame after track load. */
+  private findNearestCornerWithinTriggerDistance(
+    lat: number, lon: number, corners: Corner[], triggerDistance: number, heading: number | null,
+  ): Corner | null {
     let nearest: Corner | null = null;
-    let minDist = 150;
+    let minDist = triggerDistance;
     for (const c of corners) {
       const dist = haversineDistance(lat, lon, c.lat, c.lon);
-      if (dist < minDist) {
-        minDist = dist;
-        nearest = c;
+      if (dist >= minDist) continue;
+      // Heading-aware rejection: if we know which way the driver is facing,
+      // skip corners ≥ 90° behind. 90° is the simplest correct cutoff —
+      // anything further forward than perpendicular counts as "ahead".
+      if (heading !== null) {
+        const bearing = calculateHeading(lat, lon, c.lat, c.lon);
+        let diff = Math.abs(bearing - heading) % 360;
+        if (diff > 180) diff = 360 - diff;
+        if (diff >= 90) continue;
       }
+      minDist = dist;
+      nearest = c;
     }
     return nearest;
   }
